@@ -1,0 +1,83 @@
+# 1. Service headless : donne a chaque pod un nom DNS stable
+apiVersion: v1
+kind: Service
+metadata:
+  name: cockroachdb
+  labels:
+    app: cockroachdb
+spec:
+  clusterIP: None                  # c'est ce "None" qui le rend headless
+  publishNotReadyAddresses: true   # indispensable : les noeuds doivent se
+                                   # joindre AVANT d'etre prets
+  selector:
+    app: cockroachdb
+  ports:
+    - name: sql
+      port: 26257
+    - name: http
+      port: 8080
+
+---
+# 2. StatefulSet : 3 noeuds, chacun avec son volume
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cockroachdb
+spec:
+  serviceName: cockroachdb         # doit pointer sur le Service headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cockroachdb
+  template:
+    metadata:
+      labels:
+        app: cockroachdb
+    spec:
+      containers:
+        - name: cockroachdb
+          image: cockroachdb/cockroach:latest
+          ports:
+            - containerPort: 26257
+            - containerPort: 8080
+          command: ["/bin/bash", "-ecx"]
+          args:
+            # Meme commande pour les 3 pods : seul $(hostname -f) change
+            # (cockroachdb-N.cockroachdb.<namespace>.svc.cluster.local).
+            - >-
+              exec /cockroach/cockroach start
+              --insecure
+              --advertise-addr=$(hostname -f)
+              --listen-addr=0.0.0.0:26257
+              --http-addr=0.0.0.0:8080
+              --join=cockroachdb-0.cockroachdb,cockroachdb-1.cockroachdb,cockroachdb-2.cockroachdb
+          volumeMounts:
+            - name: datadir
+              mountPath: /cockroach/cockroach-data
+  volumeClaimTemplates:
+    - metadata:
+        name: datadir
+        labels:
+          app: cockroachdb         # permet "kubectl delete pvc -l app=cockroachdb"
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi
+        # pas de storageClassName : la classe par defaut de la grappe s'applique
+
+---
+# 3. Service normal : le point d'entree de votre application
+apiVersion: v1
+kind: Service
+metadata:
+  name: cockroachdb-public
+  labels:
+    app: cockroachdb
+spec:
+  selector:
+    app: cockroachdb
+  ports:
+    - name: sql
+      port: 26257
+      targetPort: 26257
