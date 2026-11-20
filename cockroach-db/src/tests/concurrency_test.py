@@ -5,6 +5,7 @@ Auteurs : Gabriel C. Ullmann, Fabio Petrillo, 2025
 """
 
 import argparse
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -48,7 +49,16 @@ def create_order(barrier: threading.Barrier, host: str, endpoint: str,
         }
 
 
-def run_test(host: str, endpoint: str, n_threads: int, product_id: int, label: str) -> None:
+def get_stock(host: str, product_id: int):
+    """Quantité en stock d'un article (None si l'API ne répond pas)"""
+    try:
+        stocks = requests.get(f"{host}/stocks", timeout=5).json()
+        return next((s["quantity"] for s in stocks if s["product_id"] == product_id), None)
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def run_test(host: str, endpoint: str, n_threads: int, product_id: int, label: str) -> bool:
     logger.debug(f"\n{'='*60}")
     logger.debug(f"  Stratégie : {label}")
     logger.debug(f"  Endpoint  : {endpoint}")
@@ -62,6 +72,7 @@ def run_test(host: str, endpoint: str, n_threads: int, product_id: int, label: s
     except requests.RequestException as e:
         logger.debug(f"  Impossible de réinitialiser les stocks : {e}\n")
 
+    stock_before = get_stock(host, product_id)
     barrier = threading.Barrier(n_threads)
     results = []
 
@@ -95,6 +106,16 @@ def run_test(host: str, endpoint: str, n_threads: int, product_id: int, label: s
         avg_total = round(sum(r["elapsed"] for r in results) / len(results), 3)
         logger.debug(f"  Latence moyenne (total)   : {avg_total}s")
 
+    # Vérification (utilisée par le pipeline CI/CD) : jamais de survente, et chaque commande acceptée a bien retiré du stock
+    stock_after = get_stock(host, product_id)
+    passed = (stock_before is not None and stock_after is not None
+              and stock_after >= 0
+              and len(successes) >= 1
+              and stock_before - stock_after == len(successes))
+    logger.debug(f"  Stock article {product_id} : {stock_before} -> {stock_after}  "
+                 f"({'OK' if passed else 'ÉCHEC : stock incohérent'})")
+    return passed
+
 
 def main():
     parser = argparse.ArgumentParser(description="Test de concurrence – verrous distribués (CockroachDB)")
@@ -110,11 +131,14 @@ def main():
     logger.debug(f"  Threads : {args.threads}")
     logger.debug(f"  Produit : {args.product}")
 
-    run_test(args.host, "/orders/pessimistic", args.threads, args.product,
-             "Pessimiste (SELECT FOR UPDATE)")
-    run_test(args.host, "/orders/optimistic",  args.threads, args.product,
-             "Optimiste  (version + UPDATE conditionnel)")
+    pessimistic_ok = run_test(args.host, "/orders/pessimistic", args.threads, args.product,
+                              "Pessimiste (SELECT FOR UPDATE)")
+    optimistic_ok = run_test(args.host, "/orders/optimistic",  args.threads, args.product,
+                             "Optimiste  (version + UPDATE conditionnel)")
 
+    if not (pessimistic_ok and optimistic_ok):
+        logger.debug("\n✘ Test de concurrence échoué.\n")
+        sys.exit(1)
     logger.debug("\n✔ Tests terminés.\n")
 
 
