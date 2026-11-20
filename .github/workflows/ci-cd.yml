@@ -1,0 +1,92 @@
+# Labo 09 – Activité 7 : pipeline CI/CD
+# À chaque push :
+#   1. démarre la grappe CockroachDB (3 nœuds) + l'application, puis lance concurrency_test.py ;
+#   2. seulement si le test réussit, construit l'image de l'application et la publie sur GHCR.
+# Le déploiement sur la grappe Kubernetes de l'ÉTS se fait ensuite à la main avec k8s/deploy.sh (VPN requis) :
+# les runners de GitHub sont hors du réseau de l'ÉTS et ne peuvent pas joindre la grappe.
+name: CI/CD
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  concurrency-test:
+    name: Test de concurrence (CockroachDB)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cockroach-db
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      # .env n'est pas versionné, mais le Dockerfile le copie dans l'image
+      - name: Créer le fichier .env
+        run: cp .env.example .env
+
+      - name: Démarrer la grappe CockroachDB et l'application
+        run: docker compose up -d --build cockroach1 cockroach2 cockroach3 cluster-init db-init python-app
+
+      - name: Attendre que l'API réponde
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5000/health > /dev/null; then
+              echo "API prête après $((i * 5)) s"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "L'API n'a pas démarré à temps"
+          exit 1
+
+      # Le script se termine avec le code 1 s'il y a survente ou un stock incohérent : le job échoue et rien n'est publié
+      - name: Lancer concurrency_test.py
+        run: docker exec python_app_2 python tests/concurrency_test.py --threads 20 --product 3
+
+      - name: Afficher les logs en cas d'échec
+        if: failure()
+        run: docker compose logs --tail=100
+
+      - name: Arrêter les conteneurs
+        if: always()
+        run: docker compose down -v
+
+  publish:
+    name: Construire et publier l'image sur GHCR
+    needs: concurrency-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Créer le fichier .env
+        run: cp cockroach-db/.env.example cockroach-db/.env
+
+      - name: Connexion à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Nom en minuscules (GHCR refuse les majuscules) ; latest seulement pour main, le SHA du commit pour chaque push
+      - name: Étiquettes de l'image
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+
+      - name: Construire et publier
+        uses: docker/build-push-action@v6
+        with:
+          context: cockroach-db
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
