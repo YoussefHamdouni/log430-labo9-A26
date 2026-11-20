@@ -38,42 +38,96 @@ L'enregistrement A associe ce nom à l'**IP du pod lui-même**, pas à une IP vi
 2. **Pas de disque par pod.** Un Deployment n'a pas de `volumeClaimTemplates`. Soit les pods n'ont aucun volume persistant (données perdues au redémarrage), soit ils partagent le même PVC, ce que `ReadWriteOnce` interdit, et ce qui serait de toute façon incorrect, puisque chaque nœud doit avoir ses propres données. Avec le StatefulSet, `cockroachdb-1` retrouve toujours `datadir-cockroachdb-1`.
 3. **Pas d'ordre de démarrage.** Le StatefulSet crée et met à jour les pods dans l'ordre (0, 1, 2) et un à la fois. Un Deployment remplace les pods en parallèle, et pourrait arrêter la majorité des réplicas d'une range en même temps, ce qui ferait perdre le quorum Raft.
 
-## Validation de la commande de démarrage
-
-Le cluster du cours n'était pas joignable au moment du test (hors VPN). Nous avons donc vérifié la commande de démarrage du StatefulSet avec trois conteneurs Docker qui reproduisent les noms DNS du Service headless (`cockroachdb-N.cockroachdb`) :
+## Déploiement sur la grappe du cours
 
 ```
-+ hostname -f
-+ exec /cockroach/cockroach start --insecure --advertise-addr=cockroachdb-1.cockroachdb --listen-addr=0.0.0.0:26257 --http-addr=0.0.0.0:8080 --join=cockroachdb-0.cockroachdb,cockroachdb-1.cockroachdb,cockroachdb-2.cockroachdb
+$ kubectl apply -f k8s/cockroachdb.yml
+service/cockroachdb created
+statefulset.apps/cockroachdb created
+service/cockroachdb-public created
 
-$ cockroach init --insecure --host=cockroachdb-0.cockroachdb
+$ kubectl exec cockroachdb-0 -- /cockroach/cockroach init --insecure
 Cluster successfully initialized
 
-$ cockroach node status --insecure --host=cockroachdb-0.cockroachdb
-id  address                          build    is_available  is_live
-1   cockroachdb-0.cockroachdb:26257  v26.4.1  true          true
-2   cockroachdb-1.cockroachdb:26257  v26.4.1  true          true
-3   cockroachdb-2.cockroachdb:26257  v26.4.1  true          true
+$ kubectl get statefulset cockroachdb
+NAME          READY   AGE
+cockroachdb   3/3     57s
 
-$ getent hosts cockroachdb-1.cockroachdb
-172.25.0.3      cockroachdb-1.cockroachdb
+$ kubectl get pods -l app=cockroachdb -o wide
+NAME            READY   STATUS    RESTARTS   AGE   IP             NODE
+cockroachdb-0   1/1     Running   0          58s   10.1.102.221   mk8s-fiware-1
+cockroachdb-1   1/1     Running   0          51s   10.1.204.156   mk8s-fiware-2
+cockroachdb-2   1/1     Running   0          44s   10.1.163.28    atreides
+
+$ kubectl get pvc -l app=cockroachdb
+NAME                    STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS
+datadir-cockroachdb-0   Bound    pvc-61edaad8-aa03-42c4-99c7-65bf6e68d13c   1Gi        RWO            default-storage
+datadir-cockroachdb-1   Bound    pvc-d1d50a0b-9e71-4d5a-9355-0b223be218e7   1Gi        RWO            default-storage
+datadir-cockroachdb-2   Bound    pvc-197a7a53-8b4e-4205-aa47-e20be734a691   1Gi        RWO            default-storage
+
+$ kubectl get svc -l app=cockroachdb
+NAME                 TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)
+cockroachdb          ClusterIP   None             <none>        26257/TCP,8080/TCP
+cockroachdb-public   ClusterIP   10.152.183.132   <none>        26257/TCP
+
+$ kubectl exec cockroachdb-0 -- /cockroach/cockroach node status --insecure
+id  address                                                                       build    is_available  is_live
+1   cockroachdb-0.cockroachdb.log430-espace-etudiant-17.svc.cluster.local:26257   v26.4.1  true          true
+2   cockroachdb-1.cockroachdb.log430-espace-etudiant-17.svc.cluster.local:26257   v26.4.1  true          true
+3   cockroachdb-2.cockroachdb.log430-espace-etudiant-17.svc.cluster.local:26257   v26.4.1  true          true
 ```
 
-## Sorties sur la grappe du cours
+Les noms ordinaux sont prévisibles (`cockroachdb-0`, `-1`, `-2`), chaque pod a son propre volume (`datadir-cockroachdb-N`), et chaque nœud s'annonce au cluster sous son nom DNS stable. C'est le résultat de `$(hostname -f)` :
 
-<!-- TODO (avec le VPN) : exécuter les commandes ci-dessous et coller les sorties / captures ici, puis libérer les ressources. -->
+```
+$ kubectl exec cockroachdb-1 -- hostname -f
+cockroachdb-1.cockroachdb.log430-espace-etudiant-17.svc.cluster.local
+```
 
-```bash
-kubectl apply -f k8s/cockroachdb.yml
-kubectl get statefulset
-kubectl get pods -l app=cockroachdb -o wide
-kubectl exec -it cockroachdb-0 -- /cockroach/cockroach init --insecure
-kubectl get pvc
-kubectl exec -it cockroachdb-0 -- /cockroach/cockroach node status --insecure
-kubectl run dns-test --rm -it --image=busybox:1.36 --restart=Never -- nslookup cockroachdb-1.cockroachdb
-kubectl run dns-test --rm -it --image=busybox:1.36 --restart=Never -- nslookup cockroachdb
+Le Service headless n'a pas d'IP virtuelle (`CLUSTER-IP: None`), contrairement à `cockroachdb-public` (`10.152.183.132`).
 
-# Ne pas oublier :
-kubectl delete -f k8s/cockroachdb.yml
-kubectl delete pvc -l app=cockroachdb
+## nslookup depuis un pod
+
+Le nom d'un pod résout vers **l'IP de ce pod** (`10.1.204.156` est bien `cockroachdb-1`) :
+
+```
+$ kubectl run dns-test --rm -i --image=busybox:1.36 --restart=Never -- nslookup cockroachdb-1.cockroachdb.log430-espace-etudiant-17.svc.cluster.local
+Server:    10.152.183.10
+Address:   10.152.183.10:53
+Name:      cockroachdb-1.cockroachdb.log430-espace-etudiant-17.svc.cluster.local
+Address:   10.1.204.156
+```
+
+Le nom du Service headless retourne **les IP des trois pods**, et non une IP virtuelle :
+
+```
+$ kubectl run dns-test --rm -i --image=busybox:1.36 --restart=Never -- nslookup cockroachdb
+Name:      cockroachdb.log430-espace-etudiant-17.svc.cluster.local
+Address:   10.1.204.156
+Name:      cockroachdb.log430-espace-etudiant-17.svc.cluster.local
+Address:   10.1.163.28
+Name:      cockroachdb.log430-espace-etudiant-17.svc.cluster.local
+Address:   10.1.102.221
+```
+
+Le Service normal, lui, retourne **une seule IP virtuelle** (ClusterIP), derrière laquelle kube-proxy répartit les connexions. C'est ce dont l'application a besoin, pas les nœuds entre eux :
+
+```
+$ kubectl run dns-test --rm -i --image=busybox:1.36 --restart=Never -- nslookup cockroachdb-public
+Name:      cockroachdb-public.log430-espace-etudiant-17.svc.cluster.local
+Address:   10.152.183.132
+```
+
+## Libération des ressources
+
+```
+$ kubectl delete -f k8s/cockroachdb.yml
+service "cockroachdb" deleted
+statefulset.apps "cockroachdb" deleted
+service "cockroachdb-public" deleted
+
+$ kubectl delete pvc -l app=cockroachdb
+persistentvolumeclaim "datadir-cockroachdb-0" deleted
+persistentvolumeclaim "datadir-cockroachdb-1" deleted
+persistentvolumeclaim "datadir-cockroachdb-2" deleted
 ```
